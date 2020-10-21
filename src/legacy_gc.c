@@ -31,6 +31,7 @@ typedef struct NumericFieldGCCtx {
   NumericRangeTree *rt;
   uint32_t revisionId;
   NumericRangeTreeIterator *gcIterator;
+  struct NumericSkiplistIterator *gcSlIterator;
 } NumericFieldGCCtx;
 
 #define NUMERIC_GC_INITIAL_SIZE 4
