@@ -24,7 +24,8 @@ typedef struct NumericFilter {
 typedef struct {
   int sz;
   int numRecords;
-  uint32_t changed;
+  int changed;
+  int numRanges;
 } NRN_AddRv;
 
 NumericFilter *NewNumericFilter(double min, double max, int inclusiveMin, int inclusiveMax);

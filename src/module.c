@@ -29,9 +29,8 @@
 #include "redisearch_api.h"
 #include "alias.h"
 #include "module.h"
+#include "rwlock.h"
 #include "info_command.h"
-
-pthread_rwlock_t RWLock = PTHREAD_RWLOCK_INITIALIZER;
 
 #define LOAD_INDEX(ctx, srcname, write)                                                     \
   ({                                                                                        \
@@ -233,6 +232,7 @@ int QueryExplainCLICommand(RedisModuleCtx *ctx, RedisModuleString **argv, int ar
 int RSAggregateCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc);
 int RSSearchCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc);
 int RSCursorCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc);
+int RSProfileCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc);
 
 /* FT.DEL {index} {doc_id}
  *  Delete a document from the index. Returns 1 if the document was in the index, or 0 if not.
@@ -474,11 +474,11 @@ int SynUpdateCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
   bool initialScan = true;
   int offset = 3;
   int loc = RMUtil_ArgIndex(SPEC_SKIPINITIALSCAN_STR, &argv[3], 1);
-  if (loc == 0) { // if doesn't exist, `-1` is returned
+  if (loc == 0) {  // if doesn't exist, `-1` is returned
     initialScan = false;
     offset = 4;
   }
-  
+
   IndexSpec_InitializeSynonym(sp);
 
   SynonymMap_UpdateRedisStr(sp->smap, argv + offset, argc - offset, id);
@@ -583,6 +583,8 @@ static int AlterIndexInternalCommand(RedisModuleCtx *ctx, RedisModuleString **ar
       }
     }
     IndexSpec_AddFields(sp, ctx, &ac, initialScan, &status);
+  } else {
+      return RedisModule_ReplyWithError(ctx, "ALTER must be followed by SCHEMA");
   }
 
   if (QueryError_HasError(&status)) {
@@ -725,8 +727,7 @@ int ConfigCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
     size_t offset = 3;  // Might be == argc. SetOption deals with it.
     if (RSConfig_SetOption(&RSGlobalConfig, &RSGlobalConfigOptions, name, argv, argc, &offset,
                            &status) == REDISMODULE_ERR) {
-      RedisModule_ReplyWithSimpleString(ctx, QueryError_GetError(&status));
-      return REDISMODULE_OK;
+      return QueryError_ReplyAndClear(ctx, &status);
     }
     if (offset != argc) {
       RedisModule_ReplyWithSimpleString(ctx, "EXCESSARGS");
@@ -857,7 +858,7 @@ int RediSearch_InitModuleInternal(RedisModuleCtx *ctx, RedisModuleString **argv,
 
   if (CheckSupportedVestion() != REDISMODULE_OK) {
     RedisModule_Log(ctx, "warning",
-                    "Redis version is to old, please upgrade to redis %d.%d.%d and above.",
+                    "Redis version is too old, please upgrade to redis %d.%d.%d and above.",
                     supportedVersion.majorVersion, supportedVersion.minorVersion,
                     supportedVersion.patchVersion);
 
@@ -953,6 +954,8 @@ int RediSearch_InitModuleInternal(RedisModuleCtx *ctx, RedisModuleString **argv,
   RM_TRY(RedisModule_CreateCommand, ctx, RS_TAGVALS_CMD, TagValsCommand, "readonly",
          INDEX_ONLY_CMD_ARGS);
 
+  RM_TRY(RedisModule_CreateCommand, ctx, RS_PROFILE_CMD, RSProfileCommand, "readonly",
+         INDEX_ONLY_CMD_ARGS);
   RM_TRY(RedisModule_CreateCommand, ctx, RS_EXPLAIN_CMD, QueryExplainCommand, "readonly",
          INDEX_ONLY_CMD_ARGS);
   RM_TRY(RedisModule_CreateCommand, ctx, RS_EXPLAINCLI_CMD, QueryExplainCLICommand, "readonly",
@@ -1049,5 +1052,6 @@ void __attribute__((destructor)) RediSearch_CleanupModule(void) {
     SchemaPrefixes_Free();
     RedisModule_FreeThreadSafeContext(RSDummyContext);
     Dictionary_Free();
+    RediSearch_LockDestory();
   }
 }

@@ -61,3 +61,69 @@ def testMultiSortby(env):
   #TODO: allow multiple sortby steps
   #env.expect('ft.search idx foo nocontent sortby t1 sortby t3').equal(sortby_t1)
   #env.expect('ft.search idx foo nocontent sortby t2 sortby t3').equal(sortby_t2)
+
+def test_1667(env):
+  conn = getConnectionByEnv(env)
+  conn.execute_command('FT.CREATE', 'idx', 'SCHEMA', 'tag', 'TAG', 'text', 'TEXT')
+  env.expect('ft.search idx @tag:{a}').equal([0L])
+  env.expect('ft.search idx @tag:{b}').equal([0L])
+
+  conn.execute_command('HSET', 'doc', 'tag', 'a,b')
+  conn.execute_command('HSET', 'doc1', 'tag', 'abc')
+
+  # test single stopword
+  env.expect('ft.search idx @tag:{a}').equal([1L, 'doc', ['tag', 'a,b']])
+  env.expect('ft.search idx @tag:{b}').equal([1L, 'doc', ['tag', 'a,b']])
+  env.expect('ft.search idx @tag:{c}').equal([0L])
+
+  # test stopword in list
+  env.expect('ft.search idx @tag:{a|c}').equal([1L, 'doc', ['tag', 'a,b']])
+  env.expect('ft.search idx @tag:{c|a}').equal([1L, 'doc', ['tag', 'a,b']])
+  env.expect('ft.search idx @tag:{c|a|c}').equal([1L, 'doc', ['tag', 'a,b']])
+
+  # test stopword with prefix
+  env.expect('ft.search idx @tag:{ab*}').equal([1L, 'doc1', ['tag', 'abc']])
+  env.expect('ft.search idx @tag:{abc*}').equal([1L, 'doc1', ['tag', 'abc']])
+  
+  # ensure regular text field
+  conn.execute_command('HSET', 'doc_a', 'text', 'a')
+  conn.execute_command('HSET', 'doc_b', 'text', 'b')
+  env.expect('ft.search idx a').equal([0L])
+  env.expect('ft.search idx b').equal([1L, 'doc_b', ['text', 'b']])
+
+def test_MOD_865(env):
+  conn = getConnectionByEnv(env)
+  args_list = ['FT.CREATE', 'idx', 'SCHEMA']
+  for i in range(1025):
+    args_list.extend([i, 'NUMERIC', 'SORTABLE'])
+  env.expect(*args_list).error().contains('Schema is limited to 1024 fields')
+  env.expect('FT.DROPINDEX', 'idx')
+
+  args_list = ['FT.CREATE', 'idx', 'SCHEMA']
+  for i in range(129):
+    args_list.extend([i, 'TEXT'])
+  env.expect(*args_list).error().contains('Schema is limited to 128 TEXT fields')
+  env.expect('FT.DROPINDEX', 'idx')
+
+  args_list = ['FT.CREATE', 'idx', 'SCHEMA']
+  for i in range(2):
+    args_list.extend(['txt', 'TEXT'])
+  env.expect(*args_list).error().contains('Duplicate field in schema - txt')
+  env.expect('FT.DROPINDEX', 'idx')
+
+def test_issue1826(env):
+  # Stopword query is case sensitive.
+  conn = getConnectionByEnv(env)
+  conn.execute_command('FT.CREATE', 'idx', 'SCHEMA', 't', 'TEXT')
+  conn.execute_command('HSET', 'doc', 't', 'boy with glasses')
+
+  env.expect('FT.SEARCH', 'idx', 'boy with glasses').equal([1L, 'doc', ['t', 'boy with glasses']])
+  env.expect('FT.SEARCH', 'idx', 'boy With glasses').equal([1L, 'doc', ['t', 'boy with glasses']])
+
+def test_issue1834(env):
+  # Stopword query is case sensitive.
+  conn = getConnectionByEnv(env)
+  conn.execute_command('FT.CREATE', 'idx', 'SCHEMA', 't', 'TEXT')
+  conn.execute_command('HSET', 'doc', 't', 'hell hello')
+
+  env.expect('FT.SEARCH', 'idx', 'hell|hello', 'HIGHLIGHT').equal([1L, 'doc', ['t', '<b>hell</b> <b>hello</b>']])

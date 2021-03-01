@@ -347,7 +347,8 @@ ENCODER(encodeNumeric) {
   } else {
     // Floating point
     NumEncodingFloat *encFloat = &header.encFloat;
-    if (fabs(absVal - f32Num) < 0.01) {
+    if (absVal == f32Num || (RSGlobalConfig.numericCompress == true &&
+                             fabs(absVal - f32Num) < 0.01)) {
       sz += Buffer_Write(bw, (void *)&f32Num, 4);
       encFloat->isDouble = 0;
     } else {
@@ -832,13 +833,14 @@ IndexDecoderProcs InvertedIndex_GetDecoder(uint32_t flags) {
   }
 }
 
-IndexReader *NewNumericReader(const IndexSpec *sp, InvertedIndex *idx, const NumericFilter *flt) {
+IndexReader *NewNumericReader(const IndexSpec *sp, InvertedIndex *idx, const NumericFilter *flt,
+                              double rangeMin, double rangeMax) {
   RSIndexResult *res = NewNumericResult();
   res->freq = 1;
   res->fieldMask = RS_FIELDMASK_ALL;
   res->num.value = 0;
 
-  IndexDecoderCtx ctx = {.ptr = (void *)flt};
+  IndexDecoderCtx ctx = {.ptr = (void *)flt, .rangeMin = rangeMin, .rangeMax = rangeMax};
   IndexDecoderProcs procs = {.decoder = readNumeric};
   return NewIndexReaderGeneric(sp, idx, procs, ctx, res, 1);
 }
@@ -1222,6 +1224,7 @@ IndexIterator *NewReadIterator(IndexReader *ir) {
   IndexIterator *ri = rm_malloc(sizeof(IndexIterator));
   ri->ctx = ir;
   ri->mode = MODE_SORTED;
+  ri->type = READ_ITERATOR;
   ri->NumEstimated = IR_NumEstimated;
   ri->GetCriteriaTester = IR_GetCriteriaTester;
   ri->Read = IR_Read;

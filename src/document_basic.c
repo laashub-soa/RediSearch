@@ -52,14 +52,6 @@ void Document_SetPayload(Document *d, const void *p, size_t n) {
   }
 }
 
-void Document_Move(Document *dst, Document *src) {
-  if (dst == src) {
-    return;
-  }
-  *dst = *src;
-  src->flags |= DOCUMENT_F_DEAD;
-}
-
 void Document_MakeStringsOwner(Document *d) {
   if (d->flags & DOCUMENT_F_OWNSTRINGS) {
     // Already the owner
@@ -118,7 +110,9 @@ int Document_LoadSchemaFields(Document *doc, RedisSearchCtx *sctx) {
   doc->score = SchemaRule_HashScore(sctx->redisCtx, rule, k, keyname);
   payload_rms = SchemaRule_HashPayload(sctx->redisCtx, rule, k, keyname);
   if (payload_rms) {
-    doc->payload = rm_strdup(RedisModule_StringPtrLen(payload_rms, &doc->payloadSize));
+    const char *payload_str = RedisModule_StringPtrLen(payload_rms, &doc->payloadSize);
+    doc->payload = rm_malloc(doc->payloadSize);
+    memcpy((char *)doc->payload, payload_str, doc->payloadSize);
     RedisModule_FreeString(sctx->redisCtx, payload_rms);
   }
 
@@ -273,10 +267,6 @@ void Document_Clear(Document *d) {
 }
 
 void Document_Free(Document *doc) {
-  if (doc->flags & DOCUMENT_F_DEAD) {
-    return;
-  }
-
   Document_Clear(doc);
   if (doc->flags & (DOCUMENT_F_OWNREFS | DOCUMENT_F_OWNSTRINGS)) {
     RedisModule_FreeString(RSDummyContext, doc->docKey);

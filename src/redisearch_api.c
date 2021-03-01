@@ -34,8 +34,6 @@ IndexSpec* RediSearch_CreateIndex(const char* name, const RSIndexOptions* option
 
   spec->getValue = options->gvcb;
   spec->getValueCtx = options->gvcbData;
-  spec->minPrefix = 0;
-  spec->maxPrefixExpansions = -1;
   if (options->flags & RSIDXOPT_DOCTBLSIZE_UNLIMITED) {
     spec->docs.maxSize = DOCID_MAX;
   }
@@ -92,7 +90,7 @@ RSFieldID RediSearch_CreateField(IndexSpec* sp, const char* name, unsigned types
   }
   if (options & RSFLDOPT_SORTABLE) {
     fs->options |= FieldSpec_Sortable;
-    fs->sortIdx = RSSortingTable_Add(sp->sortables, fs->name, fieldTypeToValueType(fs->types));
+    fs->sortIdx = RSSortingTable_Add(&sp->sortables, fs->name, fieldTypeToValueType(fs->types));
   }
   if (options & RSFLDOPT_TXTNOSTEM) {
     fs->options |= FieldSpec_NoStemming;
@@ -166,7 +164,7 @@ int RediSearch_DeleteDocument(IndexSpec* sp, const void* docKey, size_t len) {
 }
 
 void RediSearch_DocumentAddField(Document* d, const char* fieldName, RedisModuleString* value,
-                                 RedisModuleCtx* ctx, unsigned as) {
+                                 unsigned as) {
   Document_AddField(d, fieldName, value, as);
 }
 
@@ -179,6 +177,19 @@ void RediSearch_DocumentAddFieldNumber(Document* d, const char* fieldname, doubl
   char buf[512];
   size_t len = sprintf(buf, "%lf", n);
   Document_AddFieldC(d, fieldname, buf, len, as);
+}
+
+int RediSearch_DocumentAddFieldGeo(Document* d, const char* fieldname, 
+                                    double lat, double lon, unsigned as) {
+  if (lat > GEO_LAT_MAX || lat < GEO_LAT_MIN || lon > GEO_LONG_MAX || lon < GEO_LONG_MIN) {
+    // out of range
+    return REDISMODULE_ERR;
+  }                                      
+  // The format for a geospacial point is "lon,lat"
+  char buf[24];
+  size_t len = sprintf(buf, "%.6lf,%.6lf", lon, lat);
+  Document_AddFieldC(d, fieldname, buf, len, as);
+  return REDISMODULE_OK;
 }
 
 typedef struct {
@@ -255,8 +266,26 @@ QueryNode* RediSearch_CreateNumericNode(IndexSpec* sp, const char* field, double
   return ret;
 }
 
+QueryNode* RediSearch_CreateGeoNode(IndexSpec* sp, const char* field, double lat, double lon,
+                                        double radius, RSGeoDistance unitType) {
+  QueryNode* ret = NewQueryNode(QN_GEO);
+  ret->opts.fieldMask = IndexSpec_GetFieldBit(sp, field, strlen(field));
+
+  GeoFilter *flt = rm_malloc(sizeof(*flt));
+  flt->lat = lat;
+  flt->lon = lon;
+  flt->radius = radius;
+  flt->numericFilters = NULL;
+  flt->property = rm_strdup(field);
+  flt->unitType = (GeoDistance)unitType;
+
+  ret->gn.gf = flt;
+
+  return ret;
+}
+
 QueryNode* RediSearch_CreatePrefixNode(IndexSpec* sp, const char* fieldName, const char* s) {
-  QueryNode* ret = NewQueryNode(QN_PREFX);
+  QueryNode* ret = NewQueryNode(QN_PREFIX);
   ret->pfx =
       (QueryPrefixNode){.str = (char*)rm_strdup(s), .len = strlen(s), .expanded = 0, .flags = 0};
   if (fieldName) {

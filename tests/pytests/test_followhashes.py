@@ -212,6 +212,22 @@ def testPayload(env):
         res = env.cmd('ft.search', 'things', 'foo', 'withpayloads')
         env.assertEqual(toSortedFlatList(res), toSortedFlatList([1L, 'thing:foo', 'stuff', ['name', 'foo', 'payload', 'stuff']]))
 
+def testBinaryPayload(env):
+    conn = getConnectionByEnv(env)
+    env.expect('ft.create', 'things', 'ON', 'HASH',
+                'PREFIX', '1', 'thing:',
+                'PAYLOAD_FIELD', 'payload',
+                'SCHEMA', 'name', 'text').ok()
+    conn.execute_command('hset', 'thing:foo', 'name', 'foo', 'payload', '\x00\xAB\x20')
+
+    for _ in env.retry_with_rdb_reload():
+        waitForIndex(env, 'things')
+        res = env.cmd('ft.search', 'things', 'foo')
+        env.assertEqual(toSortedFlatList(res), toSortedFlatList([1L, 'thing:foo', ['name', 'foo', 'payload', '\x00\xAB\x20']]))
+
+        res = env.cmd('ft.search', 'things', 'foo', 'withpayloads')
+        env.assertEqual(toSortedFlatList(res), toSortedFlatList([1L, 'thing:foo', '\x00\xAB\x20', ['name', 'foo', 'payload', '\x00\xAB\x20']]))
+
 def testDuplicateFields(env):
     env.expect('FT.CREATE', 'idx', 'ON', 'HASH',
                'SCHEMA', 'txt', 'TEXT', 'num', 'NUMERIC', 'SORTABLE').ok()
@@ -427,11 +443,11 @@ def testPartial(env):
     env.expect('FT.DEBUG docidtoid idx doc5').equal(9)
     env.expect('HINCRBYFLOAT doc5 test 5').equal('17.1')
     env.expect('FT.DEBUG docidtoid idx doc5').equal(10)
-    env.expect('FT.SEARCH idx *').equal([5L, 'doc5', ['test', '17.1', 'testtest', '5.5'], 
-                                             'doc4', ['test', '11', 'testtest', '5'],
-                                             'doc3', ['test', 'foo', 'testtest', 'foo'],
+    env.expect('FT.SEARCH idx *').equal([5L, 'doc1', ['test', 'bar', 'testtest', 'foo'],
                                              'doc2', ['test', 'baz', 'testtest', 'foo'],
-                                             'doc1', ['test', 'bar', 'testtest', 'foo']])
+                                             'doc3', ['test', 'foo', 'testtest', 'foo'],
+                                             'doc4', ['test', '11', 'testtest', '5'],
+                                             'doc5', ['test', '17.1', 'testtest', '5.5']])
 
 def testHDel(env):
     if env.env == 'existing-env':

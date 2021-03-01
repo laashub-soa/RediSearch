@@ -41,9 +41,15 @@ typedef enum {
   QEXEC_F_SENDRAWIDS = 0x2000,
 
   /* Flag for scorer function to create explanation strings */
-  QEXEC_F_SEND_SCOREEXPLAIN = 0x4000
+  QEXEC_F_SEND_SCOREEXPLAIN = 0x4000,
+
+  /* Profile command */
+  QEXEC_F_PROFILE = 0x8000,
+  QEXEC_F_PROFILE_LIMITED = 0x10000,
 
 } QEFlags;
+
+#define IsProfile(r) ((r)->reqflags & QEXEC_F_PROFILE)
 
 typedef enum {
   /* Received EOF from iterator */
@@ -82,8 +88,6 @@ typedef struct {
   /** Context for iterating over the queries themselves */
   QueryIterator qiter;
 
-  /** Used for identifying unique objects across this request */
-  uint32_t serial;
   /** Flags controlling query output */
   uint32_t reqflags;
 
@@ -91,12 +95,17 @@ typedef struct {
   uint32_t stateflags;
 
   /** Query timeout in milliseconds */
-  uint32_t tmoMS;
-  uint32_t tmoPolicy;
+  int32_t reqTimeout;
+  struct timespec timeoutTime;
 
   /** Cursor settings */
   unsigned cursorMaxIdle;
   unsigned cursorChunkSize;
+
+  /** Profile variables */
+  clock_t initClock; // Time of start. Reset for each cursor call
+  clock_t totalTime; // Total time. Used to accimulate cursors times
+  clock_t parseTime; // Time for parsing the query
 } AREQ;
 
 /**
@@ -214,6 +223,7 @@ ResultProcessor *Grouper_GetRP(Grouper *gr);
 void Grouper_AddReducer(Grouper *g, Reducer *r, RLookupKey *dst);
 
 void AREQ_Execute(AREQ *req, RedisModuleCtx *outctx);
+void sendChunk(AREQ *req, RedisModuleCtx *outctx, size_t limit);
 void AREQ_Free(AREQ *req);
 
 /**

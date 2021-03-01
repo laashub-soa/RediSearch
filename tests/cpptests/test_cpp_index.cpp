@@ -283,7 +283,7 @@ TEST_F(IndexTest, testUnion) {
   irs[0] = NewReadIterator(r1);
   irs[1] = NewReadIterator(r2);
 
-  IndexIterator *ui = NewUnionIterator(irs, 2, NULL, 0, 1);
+  IndexIterator *ui = NewUnionIterator(irs, 2, NULL, 0, 1, QN_UNION, NULL);
   RSIndexResult *h = NULL;
   int expected[] = {2, 3, 4, 6, 8, 9, 10, 12, 14, 15, 16, 18, 20, 21, 24, 27, 30};
   int i = 0;
@@ -322,7 +322,7 @@ TEST_F(IndexTest, testWeight) {
   irs[0] = NewReadIterator(r1);
   irs[1] = NewReadIterator(r2);
 
-  IndexIterator *ui = NewUnionIterator(irs, 2, NULL, 0, 0.8);
+  IndexIterator *ui = NewUnionIterator(irs, 2, NULL, 0, 0.8, QN_UNION, NULL);
   RSIndexResult *h = NULL;
   int expected[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 16, 18, 20};
   int i = 0;
@@ -445,7 +445,7 @@ TEST_F(IndexTest, testNumericInverted) {
 
   // printf("written %zd bytes\n", IndexBlock_DataLen(&idx->blocks[0]));
 
-  IndexReader *ir = NewNumericReader(NULL, idx, NULL);
+  IndexReader *ir = NewNumericReader(NULL, idx, NULL, 0, 0);
   IndexIterator *it = NewReadIterator(ir);
   RSIndexResult *res;
   t_docId i = 1;
@@ -473,7 +473,7 @@ TEST_F(IndexTest, testNumericVaried) {
     // printf("[%lu]: Stored %lf\n", i, nums[i]);
   }
 
-  IndexReader *ir = NewNumericReader(NULL, idx, NULL);
+  IndexReader *ir = NewNumericReader(NULL, idx, NULL, 0, 0);
   IndexIterator *it = NewReadIterator(ir);
   RSIndexResult *res;
 
@@ -516,7 +516,7 @@ static const encodingInfo infos[] = {
     {549755813888.0 - 23, 7},  // 19
     {-549755813888.0, 7},      // 20
     {1503342028.957225, 10},   // 21
-    {42.4345, 6},              // 22
+    {42.4345, 10},              // 22
     {(float)0.5, 6},           // 23
     {DBL_MAX, 10},             // 24
     {UINT64_MAX >> 12, 9},     // 25
@@ -535,7 +535,7 @@ TEST_F(IndexTest, testNumericEncoding) {
     ASSERT_EQ(infos[ii].size, sz);
   }
 
-  IndexReader *ir = NewNumericReader(NULL, idx, NULL);
+  IndexReader *ir = NewNumericReader(NULL, idx, NULL, 0, 0);
   IndexIterator *it = NewReadIterator(ir);
   RSIndexResult *res;
 
@@ -865,7 +865,7 @@ TEST_F(IndexTest, testHugeSpec) {
   s = IndexSpec_Parse("idx", (const char **)&args[0], args.size(), &err);
   ASSERT_TRUE(s == NULL);
   ASSERT_TRUE(QueryError_HasError(&err));
-  ASSERT_STREQ("Too many TEXT fields in schema", QueryError_GetError(&err));
+  ASSERT_STREQ("Schema is limited to 128 TEXT fields", QueryError_GetError(&err));
   freeSchemaArgs(args);
   QueryError_ClearError(&err);
 }
@@ -1015,9 +1015,9 @@ TEST_F(IndexTest, testDocTable) {
 
 TEST_F(IndexTest, testSortable) {
   RSSortingTable *tbl = NewSortingTable();
-  RSSortingTable_Add(tbl, "foo", RSValue_String);
-  RSSortingTable_Add(tbl, "bar", RSValue_String);
-  RSSortingTable_Add(tbl, "baz", RSValue_String);
+  RSSortingTable_Add(&tbl, "foo", RSValue_String);
+  RSSortingTable_Add(&tbl, "bar", RSValue_String);
+  RSSortingTable_Add(&tbl, "baz", RSValue_String);
   ASSERT_EQ(3, tbl->len);
 
   ASSERT_STREQ("foo", tbl->fields[0].name);

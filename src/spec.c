@@ -19,7 +19,6 @@
 #include "module.h"
 #include "aggregate/expr/expression.h"
 #include "rules.h"
-#include "commands.h"
 #include "dictionary.h"
 
 #define INITIAL_DOC_TABLE_SIZE 1000
@@ -46,6 +45,7 @@ dict *legacySpecRules;
 Version redisVersion;
 Version rlecVersion;
 bool isCrdt;
+bool isTrimming = false;
 
 //---------------------------------------------------------------------------------------------
 
@@ -178,7 +178,6 @@ static void IndexSpec_TimedOutProc(RedisModuleCtx *ctx, IndexSpec *sp) {
   RedisModule_Log(NULL, "notice", "Freeing index %s by timer", sp->name);
 #endif
 
-  dictDelete(specDict_g, sp->name);
   sp->isTimerSet = false;
   IndexSpec_Free(sp);
 
@@ -418,14 +417,20 @@ static int IndexSpec_AddFieldsInternal(IndexSpec *sp, ArgsCursor *ac, QueryError
   FieldSpec *fs = NULL;
 
   while (!AC_IsAtEnd(ac)) {
-    size_t nfieldName = 0;
+    size_t nfieldName;
     const char *fieldName = AC_GetStringNC(ac, &nfieldName);
     if (IndexSpec_GetField(sp, fieldName, nfieldName)) {
-      QueryError_SetError(status, QUERY_EINVAL, "Duplicate field in schema");
+      QueryError_SetErrorFmt(status, QUERY_EINVAL, "Duplicate field in schema - %s", fieldName);
       goto reset;
     }
 
     fs = IndexSpec_CreateField(sp, fieldName);
+
+    if (sp->numFields == SPEC_MAX_FIELDS) {
+      QueryError_SetErrorFmt(status, QUERY_ELIMIT, "Schema is limited to %d fields",
+                             SPEC_MAX_FIELDS);
+      goto reset;
+    }
 
     if (!parseFieldSpec(ac, fs, status)) {
       goto reset;
@@ -434,7 +439,8 @@ static int IndexSpec_AddFieldsInternal(IndexSpec *sp, ArgsCursor *ac, QueryError
     if (FIELD_IS(fs, INDEXFLD_T_FULLTEXT) && FieldSpec_IsIndexable(fs)) {
       int textId = IndexSpec_CreateTextId(sp);
       if (textId < 0) {
-        QueryError_SetError(status, QUERY_ELIMIT, "Too many TEXT fields in schema");
+        QueryError_SetErrorFmt(status, QUERY_ELIMIT, "Schema is limited to %d TEXT fields",
+                               SPEC_MAX_FIELD_ID);
         goto reset;
       }
 
@@ -456,11 +462,17 @@ static int IndexSpec_AddFieldsInternal(IndexSpec *sp, ArgsCursor *ac, QueryError
 
     if (FieldSpec_IsSortable(fs)) {
       if (fs->options & FieldSpec_Dynamic) {
-        QueryError_SetError(status, QUERY_EBADOPTION, "Cannot set dynamic field to sortable");
+        QueryError_SetErrorFmt(status, QUERY_EBADOPTION,
+                               "Cannot set dynamic field to sortable - %s", fieldName);
         goto reset;
       }
 
-      fs->sortIdx = RSSortingTable_Add(sp->sortables, fs->name, fieldTypeToValueType(fs->types));
+      fs->sortIdx = RSSortingTable_Add(&sp->sortables, fs->name, fieldTypeToValueType(fs->types));
+      if (fs->sortIdx == -1) {
+        QueryError_SetErrorFmt(status, QUERY_ELIMIT, "Schema is limited to %d Sortable fields",
+                               SPEC_MAX_FIELDS);
+        goto reset;
+      }
     } else {
       fs->sortIdx = -1;
     }
@@ -770,7 +782,11 @@ void IndexSpec_FreeInternals(IndexSpec *spec) {
     }
     rm_free(spec->fields);
   }
-  IndexSpec_ClearAliases(spec);
+  if (spec->uniqueId) {
+    // If uniqueid is 0, it means the index was not initialized
+    // and is being freed now during an error.
+    IndexSpec_ClearAliases(spec);
+  }
 
   if (spec->keysDict) {
     dictRelease(spec->keysDict);
@@ -813,6 +829,14 @@ void IndexSpec_Free(IndexSpec *spec) {
   if (spec->flags & Index_Temporary) {
     if (!cleanPool) {
       cleanPool = thpool_init(1);
+    }
+    // we are taking the index to a background thread to be released.
+    // before we do it we need to delete it from the index dictionary
+    // to prevent it from been freed again.c
+    dictDelete(specDict_g, spec->name);
+    if (spec->isTimerSet) {
+      RedisModule_StopTimer(RSDummyContext, spec->timerId, NULL);
+      spec->isTimerSet = false;
     }
     thpool_add_work(cleanPool, (thpool_proc)IndexSpec_FreeTask, spec);
     return;
@@ -993,8 +1017,6 @@ IndexSpec *NewIndexSpec(const char *name) {
   sp->stopwords = DefaultStopWordList();
   sp->terms = NewTrie();
   sp->keysDict = NULL;
-  sp->minPrefix = RSGlobalConfig.minTermPrefix;
-  sp->maxPrefixExpansions = RSGlobalConfig.maxPrefixExpansions;
   sp->getValue = NULL;
   sp->getValueCtx = NULL;
 
@@ -1465,8 +1487,6 @@ IndexSpec *IndexSpec_CreateFromRdb(RedisModuleCtx *ctx, RedisModuleIO *rdb, int 
   RedisModule_Free(sp->name);
   sp->name = tmpName;
   sp->flags = (IndexFlags)RedisModule_LoadUnsigned(rdb);
-  sp->maxPrefixExpansions = RSGlobalConfig.maxPrefixExpansions;
-  sp->minPrefix = RSGlobalConfig.minTermPrefix;
   if (encver < INDEX_MIN_NOFREQ_VERSION) {
     sp->flags |= Index_StoreFreqs;
   }
@@ -1479,10 +1499,7 @@ IndexSpec *IndexSpec_CreateFromRdb(RedisModuleCtx *ctx, RedisModuleIO *rdb, int 
     FieldSpec_RdbLoad(rdb, sp->fields + i, encver);
     sp->fields[i].index = i;
     if (FieldSpec_IsSortable(fs)) {
-      RS_LOG_ASSERT(fs->sortIdx < RS_SORTABLES_MAX, "sorting index is too large");
-      sp->sortables->fields[fs->sortIdx].name = fs->name;
-      sp->sortables->fields[fs->sortIdx].type = fieldTypeToValueType(fs->types);
-      sp->sortables->len = MAX(sp->sortables->len, fs->sortIdx + 1);
+      RSSortingTable_Add(&sp->sortables, fs->name, fieldTypeToValueType(fs->types));
     }
   }
 
@@ -1547,6 +1564,9 @@ IndexSpec *IndexSpec_CreateFromRdb(RedisModuleCtx *ctx, RedisModuleIO *rdb, int 
   if (oldSpec) {
     // spec already exists lets just free this one
     RedisModule_Log(NULL, "notice", "Loading an already existing index, will just ignore.");
+    // setting unique id to zero will make sure index will not be removed from global
+    // cursor map and aliases.
+    sp->uniqueId = 0;
     IndexSpec_FreeInternals(sp);
     sp = oldSpec;
   } else {
@@ -1571,8 +1591,6 @@ void *IndexSpec_LegacyRdbLoad(RedisModuleIO *rdb, int encver) {
   sp->name = rm_strdup(name);
   RedisModule_Free(name);
   sp->flags = (IndexFlags)RedisModule_LoadUnsigned(rdb);
-  sp->maxPrefixExpansions = RSGlobalConfig.maxPrefixExpansions;
-  sp->minPrefix = RSGlobalConfig.minTermPrefix;
   if (encver < INDEX_MIN_NOFREQ_VERSION) {
     sp->flags |= Index_StoreFreqs;
   }
@@ -1585,10 +1603,7 @@ void *IndexSpec_LegacyRdbLoad(RedisModuleIO *rdb, int encver) {
     FieldSpec_RdbLoad(rdb, sp->fields + i, encver);
     sp->fields[i].index = i;
     if (FieldSpec_IsSortable(fs)) {
-      assert(fs->sortIdx < RS_SORTABLES_MAX);
-      sp->sortables->fields[fs->sortIdx].name = fs->name;
-      sp->sortables->fields[fs->sortIdx].type = fieldTypeToValueType(fs->types);
-      sp->sortables->len = MAX(sp->sortables->len, fs->sortIdx + 1);
+      RSSortingTable_Add(&sp->sortables, fs->name, fieldTypeToValueType(fs->types));
     }
   }
 
@@ -1699,8 +1714,7 @@ void Indexes_RdbSave(RedisModuleIO *rdb, int when) {
     IndexSpec *sp = dictGetVal(entry);
     // we save the name plus the null terminator
     RedisModule_SaveStringBuffer(rdb, sp->name, strlen(sp->name) + 1);
-    RedisModule_SaveUnsigned(rdb, (unsigned int)sp->flags);
-
+    RedisModule_SaveUnsigned(rdb, (uint64_t)sp->flags);
     RedisModule_SaveUnsigned(rdb, sp->numFields);
     for (int i = 0; i < sp->numFields; i++) {
       FieldSpec_RdbSave(rdb, &sp->fields[i]);
@@ -1853,8 +1867,6 @@ int IndexSpec_UpdateWithHash(IndexSpec *spec, RedisModuleCtx *ctx, RedisModuleSt
   RSAddDocumentCtx *aCtx = NewAddDocumentCtx(spec, &doc, &status);
   aCtx->stateFlags |= ACTX_F_NOBLOCK | ACTX_F_NOFREEDOC;
   AddDocumentCtx_Submit(aCtx, &sctx, DOCUMENT_ADD_REPLACE);
-  // doc was set DEAD in Document_Moved and was not freed since it set as NOFREEDOC
-  doc.flags &= ~DOCUMENT_F_DEAD;
 
   Document_Free(&doc);
   return REDISMODULE_OK;

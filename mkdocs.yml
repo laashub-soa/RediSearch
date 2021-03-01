@@ -1,4 +1,4 @@
-site_name: RediSearch Documentation
+site_name: RediSearch - Redis Secondary Index & Query Engine
 site_url: https://oss.redislabs.com/redisearch
 repo_url: https://github.com/RediSearch/RediSearch
 repo_name: RediSearch/RediSearch
@@ -68,6 +68,25 @@ nav:
 
 plugins:
   - search
+  - modules-template:
+      modules:
+        - name: 'Time Series'
+          link: '/redistimeseries'
+
+        - name: 'Bloom'
+          link: '/redisbloom'
+
+        - name: 'Graph'
+          link: '/redisgraph'
+
+        - name: 'JSON'
+          link: '/redisjson'
+
+        - name: 'AI'
+          link: '/redisai'
+
+        - name: 'Gears'
+          link: '/redisgears'
   - versions-menu:
       exclude-regexes:
-        - 'v1\.8\.[0-9]+'
+        - '1\.8'

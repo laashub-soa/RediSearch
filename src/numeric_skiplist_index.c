@@ -133,7 +133,7 @@ IndexIterator *createNumericSkiplistUnionIterator(const IndexSpec *sp, NumericSk
   }
   Vector_Free(v);
 
-  IndexIterator *it = NewUnionIterator(its, vectorLen, NULL, 1, 1);
+  IndexIterator *it = NewUnionIterator(its, vectorLen, NULL, 1, 1, QN_NUMERIC, "");
   return it;
 }
 

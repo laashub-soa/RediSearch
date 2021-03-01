@@ -10,6 +10,7 @@
 #include "rmalloc.h"
 #include "rmutil/rm_assert.h"
 #include "util/heap.h"
+#include "profile.h"
 
 static int UI_SkipTo(void *ctx, t_docId docId, RSIndexResult **hit);
 static int UI_SkipToHigh(void *ctx, t_docId docId, RSIndexResult **hit);
@@ -60,8 +61,13 @@ typedef struct {
   // If set to 1, we exit skips after the first hit found and not merge further results
   int quickExit;
   size_t nexpected;
-  double weight;
+  double weight;  
   uint64_t len;
+
+  // type of query node UNION,GEO,NUMERIC...
+  QueryNodeType origType;
+  // original string for fuzzy or prefix unions
+  const char *qstr;
 } UnionIterator;
 
 static void resetMinIdHeap(UnionIterator *ui) {
@@ -73,6 +79,10 @@ static void resetMinIdHeap(UnionIterator *ui) {
   }
   RS_LOG_ASSERT(heap_count(hp) == ui->num,
                 "count should be equal to number of iterators");
+}
+
+static void UI_HeapAddChildren(UnionIterator *ui, IndexIterator *it) {
+  AggregateResult_AddChild(CURRENT_RECORD(ui), IITER_CURRENT_RECORD(it));
 }
 
 static inline t_docId UI_LastDocId(void *ctx) {
@@ -133,11 +143,12 @@ static void UI_Rewind(void *ctx) {
 }
 
 IndexIterator *NewUnionIterator(IndexIterator **its, int num, DocTable *dt, int quickExit,
-                                double weight) {
+                                double weight, QueryNodeType type, const char *qstr) {
   // create union context
   UnionIterator *ctx = rm_calloc(1, sizeof(UnionIterator));
   ctx->origits = its;
   ctx->weight = weight;
+  ctx->origType = type;
   ctx->num = num;
   ctx->norig = num;
   IITER_CLEAR_EOF(&ctx->base);
@@ -148,11 +159,13 @@ IndexIterator *NewUnionIterator(IndexIterator **its, int num, DocTable *dt, int 
   ctx->nexpected = 0;
   ctx->currIt = 0;
   ctx->heapMinId = NULL;
+  ctx->qstr = qstr;
 
   // bind the union iterator calls
   IndexIterator *it = &ctx->base;
   it->mode = MODE_SORTED;
   it->ctx = ctx;
+  it->type = UNION_ITERATOR;
   it->GetCriteriaTester = UI_GetCriteriaTester;
   it->NumEstimated = UI_NumEstimated;
   it->LastDocId = UI_LastDocId;
@@ -343,7 +356,7 @@ static inline int UI_ReadSorted(void *ctx, RSIndexResult **hit) {
 // UI_Read for iterator with high count of children
 static inline int UI_ReadSortedHigh(void *ctx, RSIndexResult **hit) {
   UnionIterator *ui = ctx;
-  IndexIterator *it;
+  IndexIterator *it = NULL;
   RSIndexResult *res;
   heap_t *hp = ui->heapMinId;
 
@@ -353,6 +366,7 @@ static inline int UI_ReadSortedHigh(void *ctx, RSIndexResult **hit) {
     return INDEXREAD_EOF;
   }
   AggregateResult_Reset(CURRENT_RECORD(ui));
+  t_docId nextValidId = ui->minDocId + 1;
 
   /*
    * A min-heap maintains all sub-iterators which are not EOF.
@@ -362,9 +376,8 @@ static inline int UI_ReadSortedHigh(void *ctx, RSIndexResult **hit) {
    */
   while (heap_count(hp)) {
     it = heap_peek(hp);
-    t_docId nextValidId = ui->minDocId + 1;
     res = IITER_CURRENT_RECORD(it);
-    if (it->minId > ui->minDocId && it->minId != 0) {
+    if (it->minId >= nextValidId && it->minId != 0) {
       // valid result since id at root of min-heap is higher than union min id
       break;
     }
@@ -379,7 +392,7 @@ static inline int UI_ReadSortedHigh(void *ctx, RSIndexResult **hit) {
       RS_LOG_ASSERT(res, "should not be NULL");
       heap_replace(hp, it);
       // after SkipTo, try test again for validity
-      if (it->minId == nextValidId) {
+      if (ui->quickExit && it->minId == nextValidId) {
         break;
       }
     }
@@ -391,7 +404,15 @@ static inline int UI_ReadSortedHigh(void *ctx, RSIndexResult **hit) {
   }
 
   ui->minDocId = it->minId;
-  AggregateResult_AddChild(CURRENT_RECORD(ui), res);
+
+  // On quickExit we just return one result. 
+  // Otherwise, we collect all the results that equal to the root of the heap.
+  if (ui->quickExit) {
+    AggregateResult_AddChild(CURRENT_RECORD(ui), res);
+  } else {
+    heap_cb_root(hp, (HeapCallback)UI_HeapAddChildren, ui);
+  }
+
   *hit = CURRENT_RECORD(ui);
   return INDEXREAD_OK;
 }
@@ -516,7 +537,7 @@ static int UI_SkipToHigh(void *ctx, t_docId docId, RSIndexResult **hit) {
   AggregateResult_Reset(CURRENT_RECORD(ui));
   CURRENT_RECORD(ui)->weight = ui->weight;
   int rc = INDEXREAD_EOF;
-  IndexIterator *it;
+  IndexIterator *it = NULL;
   RSIndexResult *res;
   heap_t *hp = ui->heapMinId;
 
@@ -539,7 +560,7 @@ static int UI_SkipToHigh(void *ctx, t_docId docId, RSIndexResult **hit) {
     // refresh heap with iterator with updated minId
     it->minId = res->docId;
     heap_replace(hp, it);
-    if (it->minId == docId) {
+    if (ui->quickExit && it->minId == docId) {
       break;
     }
   }
@@ -550,7 +571,15 @@ static int UI_SkipToHigh(void *ctx, t_docId docId, RSIndexResult **hit) {
   }
 
   rc = (it->minId == docId) ? INDEXREAD_OK : INDEXREAD_NOTFOUND;
-  AggregateResult_AddChild(CURRENT_RECORD(ui), IITER_CURRENT_RECORD(it));
+
+  // On quickExit we just return one result. 
+  // Otherwise, we collect all the results that equal to the root of the heap.
+  if (ui->quickExit) {
+    AggregateResult_AddChild(CURRENT_RECORD(ui), IITER_CURRENT_RECORD(it));
+  } else {
+    heap_cb_root(hp, (HeapCallback)UI_HeapAddChildren, ui);
+  }
+
   *hit = CURRENT_RECORD(ui);
   return rc;
 }
@@ -745,6 +774,7 @@ IndexIterator *NewIntersecIterator(IndexIterator **its_, size_t num, DocTable *d
   // bind the iterator calls
   IndexIterator *it = &ctx->base;
   it->ctx = ctx;
+  it->type = INTERSECT_ITERATOR;
   it->LastDocId = II_LastDocId;
   it->NumEstimated = II_NumEstimated;
   it->GetCriteriaTester = II_GetCriteriaTester;
@@ -1225,6 +1255,7 @@ IndexIterator *NewNotIterator(IndexIterator *it, t_docId maxDocId, double weight
 
   IndexIterator *ret = &nc->base;
   ret->ctx = nc;
+  ret->type = NOT_ITERATOR;
   ret->GetCriteriaTester = NI_GetCriteriaTester;
   ret->NumEstimated = NI_NumEstimated;
   ret->Free = NI_Free;
@@ -1442,6 +1473,7 @@ IndexIterator *NewOptionalIterator(IndexIterator *it, t_docId maxDocId, double w
 
   IndexIterator *ret = &nc->base;
   ret->ctx = nc;
+  ret->type = OPTIONAL_ITERATOR;
   ret->GetCriteriaTester = OI_GetCriteriaTester;
   ret->NumEstimated = OI_NumEstimated;
   ret->Free = OI_Free;
@@ -1564,6 +1596,7 @@ IndexIterator *NewWildcardIterator(t_docId maxId) {
 
   IndexIterator *ret = &c->base;
   ret->ctx = c;
+  ret->type = WILDCARD_ITERATOR;
   ret->Free = WI_Free;
   ret->HasNext = WI_HasNext;
   ret->LastDocId = WI_LastDocId;
@@ -1607,7 +1640,8 @@ static IndexIterator eofIterator = {.Read = EOI_Read,
                                     .LastDocId = EOI_LastDocId,
                                     .NumEstimated = EOI_NumEstimated,
                                     .Abort = EOI_Abort,
-                                    .Rewind = EOI_Rewind};
+                                    .Rewind = EOI_Rewind,
+                                    .type = EMPTY_ITERATOR};
 
 IndexIterator *NewEmptyIterator(void) {
   return &eofIterator;
@@ -1634,3 +1668,247 @@ const char *IndexIterator_GetTypeString(const IndexIterator *it) {
   }
 }
 // LCOV_EXCL_STOP
+
+
+/**********************************************************
+ * Profile printing functions
+ **********************************************************/
+
+/* Profile iterator, used for profiling. PI is added between all iterator
+ */
+typedef struct {
+  IndexIterator base;
+  IndexIterator *child;
+  size_t counter;
+  clock_t cpuTime;
+  int eof;
+} ProfileIterator, ProfileIteratorCtx;
+
+static int PI_Read(void *ctx, RSIndexResult **e) {
+  ProfileIterator *pi = ctx;
+  pi->counter++;
+  clock_t begin = clock();
+  int ret = pi->child->Read(pi->child->ctx, e);
+  if (ret == INDEXREAD_EOF) pi->eof = 1;
+  pi->base.current = pi->child->current;
+  pi->cpuTime += clock() - begin;
+  return ret;
+}
+
+static int PI_SkipTo(void *ctx, t_docId docId, RSIndexResult **hit) {
+  ProfileIterator *pi = ctx;
+  pi->counter++;
+  clock_t begin = clock();
+  int ret = pi->child->SkipTo(pi->child->ctx, docId, hit);
+  if (ret == INDEXREAD_EOF) pi->eof = 1;
+  pi->base.current = pi->child->current;
+  pi->cpuTime += clock() - begin;
+  return ret;
+}
+
+static void PI_Free(IndexIterator *it) {
+  ProfileIterator *pi = (ProfileIterator *)it;
+  pi->child->Free(pi->child);
+  rm_free(it);
+}
+
+#define PROFILE_ITERATOR_FUNC_SIGN(func, rettype)     \
+static rettype PI_##func(void *ctx) {                 \
+  ProfileIterator *pi = ctx;                          \
+  return pi->child->func(pi->child->ctx);             \
+}
+
+PROFILE_ITERATOR_FUNC_SIGN(Abort, void);
+PROFILE_ITERATOR_FUNC_SIGN(Len, size_t);
+PROFILE_ITERATOR_FUNC_SIGN(Rewind, void);
+PROFILE_ITERATOR_FUNC_SIGN(LastDocId, t_docId);
+PROFILE_ITERATOR_FUNC_SIGN(NumEstimated, size_t);
+
+static int PI_HasNext(void *ctx) {
+  ProfileIterator *pi = ctx;
+  return IITER_HAS_NEXT(pi->child);
+}
+
+/* Create a new wildcard iterator */
+IndexIterator *NewProfileIterator(IndexIterator *child) {
+  ProfileIteratorCtx *pc = rm_calloc(1, sizeof(*pc));
+  pc->child = child;
+  pc->counter = 0;
+  pc->cpuTime = 0;
+  pc->eof = 0;
+
+  IndexIterator *ret = &pc->base;
+  ret->ctx = pc;
+  ret->type = PROFILE_ITERATOR;
+  ret->Free = PI_Free;
+  ret->HasNext = PI_HasNext;
+  ret->LastDocId = PI_LastDocId;
+  ret->Len = PI_Len;
+  ret->Read = PI_Read;
+  ret->SkipTo = PI_SkipTo;
+  ret->Abort = PI_Abort;
+  ret->Rewind = PI_Rewind;
+  ret->NumEstimated = PI_NumEstimated;
+  return ret;
+}
+
+#define PRINT_PROFILE_FUNC(name) static void name(RedisModuleCtx *ctx,        \
+                                                  IndexIterator *root,        \
+                                                  size_t counter,             \
+                                                  double cpuTime,             \
+                                                  int depth,                  \
+                                                  int limited)
+
+PRINT_PROFILE_FUNC(printUnionIt) {
+  UnionIterator *ui = (UnionIterator *)root;
+  int printFull = !limited  || (ui->origType & QN_UNION);
+
+  int arrayLen = 2 + PROFILE_VERBOSE;
+  arrayLen += printFull ? ui->norig : 1;
+  RedisModule_ReplyWithArray(ctx, arrayLen);
+
+  char *unionTypeStr;
+  switch (ui->origType) {
+  case QN_GEO : unionTypeStr = "Union iterator - GEO"; break;
+  case QN_TAG : unionTypeStr = "Union iterator - TAG"; break;
+  case QN_UNION : unionTypeStr = "Union iterator - UNION"; break;
+  case QN_FUZZY : unionTypeStr = "Union iterator - FUZZY"; break;
+  case QN_PREFIX : unionTypeStr = "Union iterator - PREFIX"; break;
+  case QN_NUMERIC : unionTypeStr = "Union iterator - NUMERIC"; break;
+  case QN_LEXRANGE : unionTypeStr = "Union iterator - LEXRANGE"; break;
+  default:
+    RS_LOG_ASSERT(0, "Invalid type for union");
+    break;
+  }
+
+  if (!ui->qstr) {
+    RedisModule_ReplyWithSimpleString(ctx, unionTypeStr);
+  } else {
+    RedisModule_ReplyWithPrintf(ctx, "%s - %s", unionTypeStr, ui->qstr);
+  }
+
+  RedisModule_ReplyWithLongLong(ctx, counter);
+  if (PROFILE_VERBOSE) RedisModule_ReplyWithDouble(ctx, cpuTime);
+  if (printFull) {
+    for (int i = 0; i < ui->norig; i++) {
+      printIteratorProfile(ctx, ui->origits[i], 0, 0, depth + 1, limited);
+    }
+  } else {
+    RedisModule_ReplyWithPrintf(ctx, "The number of iterators in union is %d", ui->norig);
+  }
+}
+
+PRINT_PROFILE_FUNC(printIntersectIt) {
+  IntersectIterator *ii = (IntersectIterator *)root;
+  RedisModule_ReplyWithArray(ctx, ii->num + 2 + PROFILE_VERBOSE);
+  RedisModule_ReplyWithSimpleString(ctx, "Intersect iterator");
+  RedisModule_ReplyWithLongLong(ctx, counter);
+  if (PROFILE_VERBOSE) RedisModule_ReplyWithDouble(ctx, cpuTime);
+  for (int i = 0; i < ii->num; i++) {
+    if (ii->its[i]) {
+      printIteratorProfile(ctx, ii->its[i], 0, 0, depth + 1, limited);
+    } else {
+      RedisModule_ReplyWithNull(ctx);
+    }
+  }
+}
+
+#define PRINT_PROFILE_SINGLE(name, iterType, text, hasChild)                        \
+PRINT_PROFILE_FUNC(name) {                                                          \
+  int verbose = PROFILE_VERBOSE;                                                    \
+  int addChild = hasChild && ((iterType *)root)->child;                             \
+  RedisModule_ReplyWithArray(ctx, 2 + verbose + addChild);                          \
+  RedisModule_ReplyWithSimpleString(ctx, text);                                     \
+  RedisModule_ReplyWithLongLong(ctx, counter);                                      \
+  if (verbose)                                                                      \
+    RedisModule_ReplyWithLongDouble(ctx, cpuTime);                                  \
+  if (addChild)                                                                     \
+    printIteratorProfile(ctx, ((iterType *)root)->child, 0, 0, depth + 1, limited); \
+}
+
+typedef struct {
+  IndexIterator base;
+  IndexIterator *child;
+} DummyIterator;
+
+PRINT_PROFILE_SINGLE(printNotIt, NotIterator, "Not iterator", 1);
+PRINT_PROFILE_SINGLE(printOptionalIt, OptionalIterator, "Optional iterator", 1);
+PRINT_PROFILE_SINGLE(printWildcardIt, DummyIterator, "Wildcard iterator", 0);
+PRINT_PROFILE_SINGLE(printIdListIt, DummyIterator, "ID-List iterator", 0);
+PRINT_PROFILE_SINGLE(printEmptyIt, DummyIterator, "Empty iterator", 0);
+
+PRINT_PROFILE_FUNC(printProfileIt) {
+  ProfileIterator *pi = (ProfileIterator *)root;
+  printIteratorProfile(ctx, pi->child, pi->counter - pi->eof, (double)pi->cpuTime / CLOCKS_PER_MILLISEC, depth, limited);
+}
+
+void printIteratorProfile(RedisModuleCtx *ctx, IndexIterator *root, size_t counter,
+                          double cpuTime, int depth, int limited) {
+  if (root == NULL) return;
+
+  // protect against limit of 7 reply layers
+  if (depth == REDIS_ARRAY_LIMIT && !isFeatureSupported(NO_REPLY_DEPTH_LIMIT)) {
+    RedisModule_ReplyWithNull(ctx);
+    return;
+  }
+
+  switch (root->type) {
+    // Reader
+    case READ_ITERATOR:       { printReadIt(ctx, root, counter, cpuTime);                       break; }
+    // Multi values
+    case UNION_ITERATOR:      { printUnionIt(ctx, root, counter, cpuTime, depth, limited);      break; }
+    case INTERSECT_ITERATOR:  { printIntersectIt(ctx, root, counter, cpuTime, depth, limited);  break; }
+    // Single value
+    case NOT_ITERATOR:        { printNotIt(ctx, root, counter, cpuTime, depth, limited);        break; }
+    case OPTIONAL_ITERATOR:   { printOptionalIt(ctx, root, counter, cpuTime, depth, limited);   break; }
+    case WILDCARD_ITERATOR:   { printWildcardIt(ctx, root, counter, cpuTime, depth, limited);   break; }
+    case EMPTY_ITERATOR:      { printEmptyIt(ctx, root, counter, cpuTime, depth, limited);      break; }
+    case ID_LIST_ITERATOR:    { printIdListIt(ctx, root, counter, cpuTime, depth, limited);     break; }
+    case PROFILE_ITERATOR:    { printProfileIt(ctx, root, 0, 0, depth, limited);                break; }
+    default:          { RS_LOG_ASSERT(0, "nope");   break; }
+  }
+}
+
+/** Add Profile iterator before any iterator in the tree */ 
+void Profile_AddIters(IndexIterator **root) {
+  UnionIterator *ui;
+  IntersectIterator *ini;
+
+  if (*root == NULL) return;
+
+  // Add profile iterator before child iterators
+  switch((*root)->type) {
+    case NOT_ITERATOR:
+      Profile_AddIters(&((NotIterator *)root)->child);
+      break;
+    case OPTIONAL_ITERATOR:
+      Profile_AddIters(&((OptionalIterator *)root)->child);
+      break;
+    case WILDCARD_ITERATOR:
+      Profile_AddIters(&((NotIterator *)root)->child);
+      break;     
+    case UNION_ITERATOR:
+      ui = (*root)->ctx;
+      for (int i = 0; i < ui->norig; i++) {
+        Profile_AddIters(&(ui->origits[i]));
+      }
+      UI_SyncIterList(ui);
+      break;
+    case INTERSECT_ITERATOR:
+      ini = (*root)->ctx;
+      for (int i = 0; i < ini->num; i++) {
+        Profile_AddIters(&(ini->its[i]));
+      }
+      break;
+    case READ_ITERATOR:
+    case EMPTY_ITERATOR:
+    case ID_LIST_ITERATOR:
+      break;
+    case PROFILE_ITERATOR:
+    case MAX_ITERATOR:
+      RS_LOG_ASSERT(0, "Error");
+  }
+
+  // Create a profile iterator and update outparam pointer
+  *root = NewProfileIterator(*root);
+}

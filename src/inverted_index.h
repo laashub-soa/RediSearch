@@ -43,10 +43,13 @@ struct indexReadCtx;
  * a a pointer or integer. It is intended to relay along any kind of additional
  * configuration information to help the decoder determine whether to filter
  * the entry */
-typedef union {
+typedef struct {
   void *ptr;
   t_fieldMask num;
-  t_docId matchId;
+
+  // used by profile
+  double rangeMin;    
+  double rangeMax;
 } IndexDecoderCtx;
 
 /**
@@ -172,12 +175,9 @@ size_t InvertedIndex_WriteEntryGeneric(InvertedIndex *idx, IndexEncoder encoder,
 /* Create a new index reader for numeric records, optionally using a given filter. If the filter
  * is
  * NULL we will return all the records in the index */
-IndexReader *NewNumericReader(const IndexSpec *sp, InvertedIndex *idx, const NumericFilter *flt);
-IndexReader *NewNumericSkiplistReader(const IndexSpec *sp, NumericSkiplistNode *nsn);
 
 /* Get the appropriate encoder for an inverted index given its flags. Returns NULL on invalid flags
  */
-IndexEncoder InvertedIndex_GetEncoder(IndexFlags flags);
 
 /* Create a new index reader on an inverted index buffer,
  * optionally with a skip index, docTable and scoreIndex.
@@ -225,6 +225,12 @@ t_docId IR_LastDocId(void *ctx);
 
 /* Create a reader iterator that iterates an inverted index record */
 IndexIterator *NewReadIterator(IndexReader *ir);
+
+IndexReader *NewNumericReader(const IndexSpec *sp, InvertedIndex *idx, const NumericFilter *flt,
+                              double rangeMin, double rangeMax);
+
+IndexEncoder InvertedIndex_GetEncoder(IndexFlags flags);
+IndexReader *NewNumericSkiplistReader(const IndexSpec *sp, NumericSkiplistNode *nsn);
 
 int IndexBlock_Repair(IndexBlock *blk, DocTable *dt, IndexFlags flags, IndexRepairParams *params);
 

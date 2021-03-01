@@ -418,13 +418,29 @@ class TestAggregate():
         self.env.assertEqual('__generated_aliasfirst_valuetitle,by,price,desc', rv[1][2])
 
     def testIssue1125(self):
-        rv = self.env.cmd('ft.aggregate', 'games', '*',
-                          'LIMIT', 0, 20000000)
-        self.env.assertEqual(2266, len(rv))
-
+        self.env.skipOnCluster()
         # SEARCH should fail
         self.env.expect('ft.search', 'games', '*', 'limit', 0, 2000000).error()     \
                 .contains('LIMIT exceeds maximum of 1000000')
+        # SEARCH should succeed
+        self.env.expect('ft.config', 'set', 'MAXSEARCHRESULTS', -1).ok()
+        rv = self.env.cmd('ft.search', 'games', '*',
+                          'LIMIT', 0, 12345678)
+        self.env.assertEqual(4531, len(rv))
+        # AGGREGATE should succeed
+        rv = self.env.cmd('ft.aggregate', 'games', '*',
+                          'LIMIT', 0, 12345678)
+        self.env.assertEqual(2266, len(rv))
+        # AGGREGATE should fail
+        self.env.expect('ft.config', 'set', 'MAXAGGREGATERESULTS', 1000000).ok()
+        self.env.expect('ft.aggregate', 'games', '*', 'limit', 0, 2000000).error()     \
+                .contains('LIMIT exceeds maximum of 1000000')
+
+        # force global limit on aggregate
+        num = 10
+        self.env.expect('ft.config', 'set', 'MAXAGGREGATERESULTS', num).ok()
+        rv = self.env.cmd('ft.aggregate', 'games', '*')
+        self.env.assertEqual(num + 1, len(rv))
 
     def testMultiSortBy(self):
         self.env.expect('ft.aggregate', 'games', '*',
@@ -432,7 +448,26 @@ class TestAggregate():
                            'SORTBY', 2, '@brand', 'DESC',
                            'SORTBY', 2, '@price', 'DESC').error()\
                             .contains('Multiple SORTBY steps are not allowed. Sort multiple fields in a single step')
-  
+
+    def testCountError(self):
+        # With 0 values
+        res = self.env.cmd('ft.aggregate', 'games', '*',
+                           'GROUPBY', '2', '@brand', '@price',
+                           'REDUCE', 'COUNT', 0)
+        self.env.assertEqual(len(res), 1245)
+
+        # With count 1 and 1 value
+        res = self.env.expect('ft.aggregate', 'games', '*',
+                           'GROUPBY', '2', '@brand', '@price',
+                           'REDUCE', 'COUNT', 1, '@brand').error()      \
+                            .contains('Count accepts 0 values only')
+
+        # With count 1 and 0 values
+        res = self.env.expect('ft.aggregate', 'games', '*',
+                           'GROUPBY', '2', '@brand', '@price',
+                           'REDUCE', 'COUNT', 1).error()        \
+                            .contains('Bad arguments for COUNT: Expected an argument, but none provided')
+
     # def testLoadAfterSortBy(self):
     #     with self.env.assertResponseError():
     #         self.env.cmd('ft.aggregate', 'games', '*',
@@ -518,3 +553,75 @@ def testStartsWith(env):
     env.assertEqual(toSortedFlatList(res), toSortedFlatList([1L, ['t', 'aa', 'prefix', '1'], \
                                                                  ['t', 'aaa', 'prefix', '1'], \
                                                                  ['t', 'ab', 'prefix', '0']]))
+
+def testContains(env):
+    conn = getConnectionByEnv(env)
+    env.execute_command('ft.create', 'idx', 'SCHEMA', 't', 'TEXT', 'SORTABLE')
+    conn.execute_command('hset', 'doc1', 't', 'aa')
+    conn.execute_command('hset', 'doc2', 't', 'bba')
+    conn.execute_command('hset', 'doc3', 't', 'aba')
+    conn.execute_command('hset', 'doc4', 't', 'abb')
+    conn.execute_command('hset', 'doc5', 't', 'abba')
+    conn.execute_command('hset', 'doc6', 't', 'abbabb')
+
+    res = env.cmd('ft.aggregate', 'idx', '*', 'load', 1, 't', 'apply', 'contains(@t, "bb")', 'as', 'substring')
+    env.assertEqual(toSortedFlatList(res), toSortedFlatList([1L, ['t', 'aa', 'substring', '0'], \
+                                                             ['t', 'bba', 'substring', '1'], \
+                                                             ['t', 'aba', 'substring', '0'], \
+                                                             ['t', 'abb', 'substring', '1'], \
+                                                             ['t', 'abba', 'substring', '1'], \
+                                                             ['t', 'abbabb', 'substring', '2']]))
+
+def testLimitIssue(env):
+    #ticket 66895
+    conn = getConnectionByEnv(env)
+    conn.execute_command('ft.create', 'idx', 'SCHEMA', 'PrimaryKey', 'TEXT', 'SORTABLE',
+                                           'CreatedDateTimeUTC', 'NUMERIC', 'SORTABLE')
+    conn.execute_command('HSET', 'doc1', 'PrimaryKey', '9::362330', 'CreatedDateTimeUTC', '637387878524969984')
+    conn.execute_command('HSET', 'doc2', 'PrimaryKey', '9::362329', 'CreatedDateTimeUTC', '637387875859270016')
+    conn.execute_command('HSET', 'doc3', 'PrimaryKey', '9::362326', 'CreatedDateTimeUTC', '637386176589869952')
+    conn.execute_command('HSET', 'doc4', 'PrimaryKey', '9::362311', 'CreatedDateTimeUTC', '637383865971600000')
+    conn.execute_command('HSET', 'doc5', 'PrimaryKey', '9::362310', 'CreatedDateTimeUTC', '637383864050669952')
+    conn.execute_command('HSET', 'doc6', 'PrimaryKey', '9::362309', 'CreatedDateTimeUTC', '637242254008029952')
+    conn.execute_command('HSET', 'doc7', 'PrimaryKey', '9::362308', 'CreatedDateTimeUTC', '637242253551670016')
+    conn.execute_command('HSET', 'doc8', 'PrimaryKey', '9::362306', 'CreatedDateTimeUTC', '637166988081200000')
+
+    _res = [8L,
+          ['PrimaryKey', '9::362330', 'CreatedDateTimeUTC', '637387878524969984'],
+          ['PrimaryKey', '9::362329', 'CreatedDateTimeUTC', '637387875859270016'],
+          ['PrimaryKey', '9::362326', 'CreatedDateTimeUTC', '637386176589869952'],
+          ['PrimaryKey', '9::362311', 'CreatedDateTimeUTC', '637383865971600000'],
+          ['PrimaryKey', '9::362310', 'CreatedDateTimeUTC', '637383864050669952'],
+          ['PrimaryKey', '9::362309', 'CreatedDateTimeUTC', '637242254008029952'],
+          ['PrimaryKey', '9::362308', 'CreatedDateTimeUTC', '637242253551670016'],
+          ['PrimaryKey', '9::362306', 'CreatedDateTimeUTC', '637166988081200000']]
+
+    actual_res = conn.execute_command('FT.AGGREGATE', 'idx', '*',
+                'APPLY', '@PrimaryKey', 'AS', 'PrimaryKey',
+                'SORTBY', '2', '@CreatedDateTimeUTC', 'DESC', 'LIMIT', '0', '8')
+    env.assertEqual(actual_res, _res)
+
+    res = [_res[0]] + _res[1:3]
+    actual_res = conn.execute_command('FT.AGGREGATE', 'idx', '*',
+                'APPLY', '@PrimaryKey', 'AS', 'PrimaryKey',
+                'SORTBY', '2', '@CreatedDateTimeUTC', 'DESC', 'LIMIT', '0', '2')
+    env.assertEqual(actual_res, res)
+
+    res = [_res[0]] + _res[2:4]
+    actual_res = conn.execute_command('FT.AGGREGATE', 'idx', '*',
+                'APPLY', '@PrimaryKey', 'AS', 'PrimaryKey',
+                'SORTBY', '2', '@CreatedDateTimeUTC', 'DESC', 'LIMIT', '1', '2')
+    env.assertEqual(actual_res, res)
+
+    res = [_res[0]] + _res[3:5]
+    actual_res = conn.execute_command('FT.AGGREGATE', 'idx', '*',
+                'APPLY', '@PrimaryKey', 'AS', 'PrimaryKey',
+                'SORTBY', '2', '@CreatedDateTimeUTC', 'DESC', 'LIMIT', '2', '2')
+    env.assertEqual(actual_res, res)
+
+def testMaxAggResults():
+    env = Env(moduleArgs="MAXAGGREGATERESULTS 100")
+    conn = getConnectionByEnv(env)
+    conn.execute_command('ft.create', 'idx', 'SCHEMA', 't', 'TEXT')
+    env.expect('ft.aggregate', 'idx', '*', 'LIMIT', '0', '10000').error()   \
+                .contains('LIMIT exceeds maximum of 100')
